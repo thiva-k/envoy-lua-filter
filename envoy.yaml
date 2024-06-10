@@ -1,0 +1,93 @@
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local_service
+                      domains:
+                        - "*"
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: web_service
+                http_filters:
+                  # Ensure Lua filter is applied first
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      inline_code: |
+                        local redis = require "redis"
+                        local red = redis.connect('redis', 6379)
+
+                        local function increment_rate_limit(remote_address)
+                            local rate_limit_key = "rate_limit:" .. remote_address
+                            local limit_result = red:get(rate_limit_key)
+                            local limit = tonumber(limit_result or "0")
+
+                            if limit >= 5 then
+                                return false -- Exceeded rate limit
+                            else
+                                red:incr(rate_limit_key)
+                                red:expire(rate_limit_key, 60) -- Set expiry time to 60 seconds
+                                return true -- Within rate limit
+                            end
+                        end
+
+                        function envoy_on_request(request_handle)
+                            request_handle:logInfo("Lua script started")
+
+                            local remote_address = request_handle:headers():get(":authority")
+                            local path = request_handle:headers():get(":path")
+
+                            if remote_address and path then
+                                request_handle:logInfo("Client IP: " .. remote_address .. ", Path: " .. path)
+
+                                if path == "/" then
+                                    if not increment_rate_limit(remote_address) then
+                                        request_handle:logInfo("Rate limit exceeded for " .. remote_address)
+                                        request_handle:respond(
+                                            {
+                                                [":status"] = "429",
+                                                ["content-type"] = "text/plain"
+                                            },
+                                            "Rate limit exceeded"
+                                        )
+                                        return
+                                    end
+                                else
+                                    request_handle:logInfo("Skipping rate limit for path: " .. path)
+                                end
+                            else
+                                request_handle:logInfo("Remote address or path not found in headers")
+                            end
+                        end
+                  # HTTP router filter should be the last one
+                  - name: envoy.filters.http.router
+                    typed_config: 
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: web_service
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: web_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: webui
+                      port_value: 8080
